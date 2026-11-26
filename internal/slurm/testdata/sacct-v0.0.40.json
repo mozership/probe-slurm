@@ -1,0 +1,51 @@
+{
+  "jobs": [
+    {
+      "account": "lab",
+      "job_id": 42,
+      "name": "probe",
+      "user": "probe",
+      "partition": "debug",
+      "nodes": "c1",
+      "state": {"current": ["NODE_FAIL"], "reason": "None"},
+      "exit_code": {"status": ["SIGNALED"], "return_code": {"set": true, "infinite": false, "number": 0}, "signal": {"id": {"set": true, "infinite": false, "number": 9}, "name": "KILL"}},
+      "time": {"submission": 1764000000, "start": 1764000005, "end": 1764000010, "elapsed": 5},
+      "comment": {"administrator": "", "job": "", "system": ""},
+      "stdout": "/home/probe/slurm-%j.out",
+      "working_directory": "/home/probe",
+      "array": {"job_id": 0, "task_id": {"set": false, "infinite": false, "number": 0}}
+    },
+    {
+      "account": "lab",
+      "job_id": 42,
+      "name": "probe",
+      "user": "probe",
+      "partition": "debug",
+      "nodes": "c2",
+      "state": {"current": ["COMPLETED"], "reason": "None"},
+      "exit_code": {"status": ["SUCCESS"], "return_code": {"set": true, "infinite": false, "number": 0}, "signal": {"id": {"set": false, "infinite": false, "number": 0}, "name": ""}},
+      "time": {"submission": 1764000000, "start": 1764000020, "end": 1764000030, "elapsed": 10},
+      "comment": {"administrator": "", "job": "", "system": ""},
+      "stdout": "/home/probe/slurm-%j.out",
+      "stdout_expanded": "/home/probe/slurm-42.out",
+      "working_directory": "/home/probe",
+      "array": {"job_id": 0, "task_id": {"set": false, "infinite": false, "number": 0}}
+    },
+    {
+      "account": "lab",
+      "job_id": 44,
+      "name": "queued",
+      "user": "probe",
+      "partition": "debug",
+      "nodes": "None assigned",
+      "state": {"current": "PENDING", "reason": "Priority"},
+      "exit_code": {"status": "PENDING", "return_code": 0},
+      "time": {"submission": 1764000000, "start": 0, "end": 0, "elapsed": 0},
+      "comment": {"job": "note"},
+      "stdout": "",
+      "working_directory": "/home/probe",
+      "array": {"job_id": 0, "task_id": null}
+    }
+  ],
+  "errors": []
+}

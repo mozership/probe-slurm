@@ -1,0 +1,43 @@
+# Run by e2e/workflow.yml under the guard, against the cluster it started:
+# the steps that read are run, and the one that submits is refused, which
+# ends the run with the exit code 2.
+name: probe-slurm under the guard
+
+actions:
+  slurm: ./action
+
+vars:
+  port: "{{E2E_PORT}}"
+  work: "{{E2E_WORK}}"
+
+jobs:
+- name: Read, then submit
+  defaults:
+    slurm:
+      host: localhost
+      port: "{{vars.port}}"
+      user: probe
+      key_file: "{{vars.work}}/id_ed25519"
+      known_hosts: "{{vars.work}}/known_hosts"
+  steps:
+  - name: Partitions
+    uses: slurm
+    with:
+      partitions: debug
+    test: status == 0 && res.partitions[0].state == "UP"
+
+  - name: Jobs
+    uses: slurm
+    with:
+      jobs:
+        user: probe
+    test: status == 0
+
+  - name: Submit
+    uses: slurm
+    with:
+      submit:
+        script: |
+          #!/bin/sh
+          true
+    test: status == 0

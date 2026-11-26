@@ -1,0 +1,6 @@
+{
+  "nodes": [
+    {"name": "c1", "state": "idle+drain*", "partitions": "debug,long", "reason": "maintenance", "cpus": 2, "alloc_cpus": 0}
+  ],
+  "errors": []
+}

@@ -1,0 +1,74 @@
+name: Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  # The tests above answer from a stand-in for Slurm. This one runs the
+  # action through Probe against Slurm itself, a cluster of one node in a
+  # container that the action logs in to over SSH.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      # Probe resolves the action before the first job of the workflow, so it
+      # is built first.
+      - run: go build -o e2e/action/probe-slurm .
+      # The probe the e2e workflow runs, and runs again for its cleanup and
+      # under the guard. The action checks it against the digest of its
+      # release and adds it to PATH.
+      - name: Install Probe
+        uses: mozership/probe-action@831b8b6c6aa0c8a61aa75b58f36a08da5c579e83 # v1.3.0
+        with:
+          install-only: true
+          version: v1.43.0
+      # Under --allow-host, which the action keeps to. The shell steps that
+      # build and run the container are let run with --allow-action.
+      - run: probe --allow-host localhost --allow-action shell --report github-summary e2e/workflow.yml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+      # go fix rewrites code to what the Go version in go.mod has, such as
+      # maps.Copy for a loop that copies a map. -diff prints the rewrites
+      # instead of applying them, and fails when there is any: run go fix ./...
+      # and commit what it changes.
+      - name: go fix
+        run: go fix -diff ./...
+
+  # govulncheck fails on a vulnerability the code calls, in a module it
+  # requires or in the standard library of the Go in go.mod, which releases
+  # are built with: update the module, or the Go in go.mod.
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...

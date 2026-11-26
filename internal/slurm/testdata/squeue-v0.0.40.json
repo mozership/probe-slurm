@@ -1,0 +1,45 @@
+{
+  "jobs": [
+    {
+      "account": "lab",
+      "job_id": 42,
+      "name": "probe",
+      "user_name": "probe",
+      "partition": "debug",
+      "job_state": ["COMPLETED"],
+      "state_reason": "None",
+      "nodes": "c1",
+      "comment": "",
+      "submit_time": {"set": true, "infinite": false, "number": 1764000000},
+      "start_time": {"set": true, "infinite": false, "number": 1764000005},
+      "end_time": {"set": true, "infinite": false, "number": 1764000015},
+      "exit_code": {"status": ["SUCCESS"], "return_code": {"set": true, "infinite": false, "number": 0}, "signal": {"id": {"set": false, "infinite": false, "number": 0}, "name": ""}},
+      "standard_output": "slurm-%j.out",
+      "current_working_directory": "/home/probe",
+      "array_job_id": {"set": true, "infinite": false, "number": 0},
+      "array_task_id": {"set": false, "infinite": false, "number": 0}
+    },
+    {
+      "account": "lab",
+      "job_id": 43,
+      "name": "waits",
+      "user_name": "probe",
+      "partition": "debug",
+      "job_state": ["PENDING"],
+      "state_reason": "Resources",
+      "nodes": "",
+      "comment": "",
+      "submit_time": {"set": true, "infinite": false, "number": 1764000100},
+      "start_time": {"set": true, "infinite": false, "number": 1764003600},
+      "end_time": {"set": true, "infinite": false, "number": 1764007200},
+      "exit_code": {"status": ["PENDING"], "return_code": {"set": false, "infinite": false, "number": 0}, "signal": {"id": {"set": false, "infinite": false, "number": 0}, "name": ""}},
+      "standard_output": "/scratch/%u/%x-%A_%a.out",
+      "current_working_directory": "/home/probe",
+      "array_job_id": {"set": true, "infinite": false, "number": 40},
+      "array_task_id": {"set": true, "infinite": false, "number": 3}
+    }
+  ],
+  "meta": {"plugin": {"type": "openapi/v0.0.40", "data_parser": "data_parser/v0.0.40"}},
+  "errors": [],
+  "warnings": []
+}

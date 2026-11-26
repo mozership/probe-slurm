@@ -1,0 +1,4 @@
+/probe-slurm
+/dist/
+/e2e/action/probe-slurm
+/e2e/.work/

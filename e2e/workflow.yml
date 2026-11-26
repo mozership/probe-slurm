@@ -1,0 +1,328 @@
+# The end-to-end tests: a Slurm cluster of one node in a container, built
+# from e2e/cluster, which the action logs in to over SSH as it would to a
+# login node, all in this one workflow. It runs under --allow-host, which the
+# action keeps to; the shell steps that build and run the container are let
+# run with --allow-action. Run it from the repository root, with the action
+# built first, as Probe resolves it before the first job:
+#
+#   go build -o e2e/action/probe-slurm . && probe --allow-host localhost --allow-action shell e2e/workflow.yml
+#
+# E2E_PORT is the port of sshd on this side, E2E_CONTAINER the container's
+# name, and E2E_KEEP=1 leaves the container running afterwards. DOCKER is
+# the docker command, as "docker --context orbstack", and PROBE the probe
+# the last jobs run other workflows with, which default to those on PATH.
+name: probe-slurm against Slurm in a container
+
+# The action as it was just built, by the name a workflow would give a
+# released one.
+actions:
+  slurm: ./action
+
+vars:
+  image: probe-slurm-e2e
+  container: "{{E2E_CONTAINER ?? 'probe-slurm-e2e'}}"
+  port: "{{E2E_PORT ?? '12222'}}"
+  keep: "{{E2E_KEEP ?? ''}}"
+  docker: "{{DOCKER ?? 'docker'}}"
+  probe: "{{PROBE ?? 'probe'}}"
+  # The key the action logs in with, and the host key it checks, made here.
+  work: e2e/.work
+
+jobs:
+- name: Start the cluster
+  id: cluster
+  steps:
+  # Before anything is started, so that whatever happens next, the container
+  # goes when the workflow ends: Probe stops a background command then, as it
+  # does when it is interrupted. E2E_KEEP=1 leaves it.
+  - name: Remove the container when the workflow ends
+    uses: shell
+    skipif: vars.keep == "1"
+    with:
+      cmd: "trap '{{vars.docker}} rm -f {{vars.container}} >/dev/null 2>&1; exit 0' TERM INT; while :; do sleep 1; done"
+      background: true
+    test: status == -1
+
+  - name: Make a key and build the image
+    uses: shell
+    with:
+      cmd: >-
+        rm -rf {{vars.work}} && mkdir -p {{vars.work}} &&
+        ssh-keygen -q -t ed25519 -N '' -C probe-slurm-e2e -f {{vars.work}}/id_ed25519 &&
+        {{vars.docker}} build -q -t {{vars.image}} e2e/cluster
+      timeout: 900s
+    test: res.code == 0
+    echo: "{{res.stderr}}"
+
+  - name: Start the container
+    uses: shell
+    with:
+      cmd: >-
+        {{vars.docker}} rm -f {{vars.container}} >/dev/null 2>&1;
+        {{vars.docker}} run -d --name {{vars.container}}
+        -p {{vars.port}}:22
+        -e AUTHORIZED_KEY="$(cat {{vars.work}}/id_ed25519.pub)"
+        {{vars.image}}
+    test: res.code == 0
+
+  - name: Note the host key of sshd
+    uses: shell
+    with:
+      cmd: "ssh-keyscan -p {{vars.port}} localhost > {{vars.work}}/known_hosts 2>/dev/null && test -s {{vars.work}}/known_hosts"
+    retry: {max_attempts: 30, interval: 1s}
+    test: res.code == 0
+
+  - name: Wait for the node
+    uses: slurm
+    with:
+      host: localhost
+      port: "{{vars.port}}"
+      user: probe
+      key_file: "{{vars.work}}/id_ed25519"
+      known_hosts: "{{vars.work}}/known_hosts"
+      partitions: debug
+    retry: {max_attempts: 60, interval: 1s}
+    test: status == 0 && res.partitions[0].idle == 1
+
+- name: Jobs
+  id: jobs
+  needs: [cluster]
+  defaults:
+    slurm:
+      host: localhost
+      port: "{{vars.port}}"
+      user: probe
+      key_file: "{{vars.work}}/id_ed25519"
+      known_hosts: "{{vars.work}}/known_hosts"
+      # The container is gone by the time the cleanup of this run would
+      # cancel the jobs, as Probe stops the command that removes it first.
+      # The jobs are kept out of the cleanup, and e2e/leave.yml tests it.
+      submit:
+        keep: true
+  steps:
+  - name: Submit a job
+    id: hello
+    uses: slurm
+    with:
+      submit:
+        name: hello
+        partition: debug
+        time: 1m
+        script: |
+          #!/bin/sh
+          echo "hello from $SLURM_JOB_ID on $(hostname -s)"
+    test: status == 0 && res.job_id > 0 && res.error == "" && req.command contains "--job-name=hello"
+    outputs:
+      job_id: res.job_id
+
+  - name: It completes, and says hello
+    uses: slurm
+    with:
+      job: "{{outputs.hello.job_id}}"
+      wait: 2m
+      poll: 1s
+      output: true
+    test: |
+      status == 0 && res.done == true &&
+      res.state == "COMPLETED" && res.exit_code == 0 && res.signal == 0 &&
+      res.name == "hello" && res.user == "probe" && res.partition == "debug" &&
+      res.stdout startsWith "hello from " + string(outputs.hello.job_id) + " on " &&
+      res.stdout_truncated == false &&
+      res.stdout_path == "/home/probe/slurm-" + string(outputs.hello.job_id) + ".out" &&
+      res.submit_time != "" && res.start_time != "" && res.end_time != "" &&
+      res.wait_sec >= 0 && res.elapsed_sec >= 0
+
+  - name: Submit a job that fails
+    id: fails
+    uses: slurm
+    with:
+      submit:
+        name: fails
+        script: |
+          #!/bin/sh
+          exit 3
+    test: status == 0
+    outputs:
+      job_id: res.job_id
+
+  - name: It fails with its exit code
+    uses: slurm
+    with:
+      job: "{{outputs.fails.job_id}}"
+      wait: 2m
+      poll: 1s
+    test: status == 1 && res.done == true && res.state == "FAILED" && res.exit_code == 3
+
+  - name: Submit a job that sleeps
+    id: sleeper
+    uses: slurm
+    with:
+      submit:
+        name: sleeper
+        time: 10m
+        script: |
+          #!/bin/sh
+          sleep 300
+    test: status == 0
+    outputs:
+      job_id: res.job_id
+
+  - name: It is in the queue
+    uses: slurm
+    with:
+      jobs:
+        user: probe
+        name: sleeper
+    test: status == 0 && res.count == 1 && res.jobs[0].job_id == outputs.sleeper.job_id && res.jobs[0].done == false
+
+  - name: Cancel it
+    uses: slurm
+    with:
+      cancel: "{{outputs.sleeper.job_id}}"
+    test: status == 0 && res.cancelled == true && res.state in ["PENDING", "RUNNING"]
+
+  - name: It is cancelled
+    uses: slurm
+    with:
+      job: "{{outputs.sleeper.job_id}}"
+      wait: 1m
+      poll: 1s
+    test: status == 1 && res.done == true && res.state == "CANCELLED"
+
+  - name: Cancelling it again cancels nothing
+    uses: slurm
+    with:
+      cancel: "{{outputs.sleeper.job_id}}"
+    test: status == 0 && res.cancelled == false && res.state == "CANCELLED"
+
+  - name: A job for a partition that is down waits
+    id: waits
+    uses: slurm
+    with:
+      submit:
+        name: waits
+        partition: closed
+        script: |
+          #!/bin/sh
+          true
+    test: status == 0
+    outputs:
+      job_id: res.job_id
+
+  - name: And tells why
+    uses: slurm
+    with:
+      job: "{{outputs.waits.job_id}}"
+      output: true
+    test: |
+      status == 1 && res.done == false && res.state == "PENDING" &&
+      res.reason == "PartitionDown" && res.start_time == "" && res.stdout == "" &&
+      res.wait_sec >= 0
+
+  - name: Cancel it
+    uses: slurm
+    with:
+      cancel: "{{outputs.waits.job_id}}"
+    test: status == 0 && res.cancelled == true
+
+  - name: A job for a partition that does not exist is refused
+    uses: slurm
+    with:
+      submit:
+        partition: nope
+        script: |
+          #!/bin/sh
+          true
+    test: status == 1 && res.job_id == 0 && res.error contains "invalid partition"
+
+- name: The cluster
+  id: state
+  needs: [jobs]
+  defaults:
+    slurm:
+      host: localhost
+      port: "{{vars.port}}"
+      user: probe
+      key_file: "{{vars.work}}/id_ed25519"
+      known_hosts: "{{vars.work}}/known_hosts"
+  steps:
+  - name: Partitions
+    uses: slurm
+    with:
+      partitions:
+    test: |
+      status == 0 && res.count == 2 &&
+      res.partitions[0].name == "debug" && res.partitions[0].state == "UP" &&
+      res.partitions[0].total_nodes == 1 &&
+      res.partitions[1].name == "closed" && res.partitions[1].state == "DOWN"
+
+  - name: Nodes
+    uses: slurm
+    with:
+      nodes: c1
+    test: |
+      status == 0 && res.count == 1 && res.nodes[0].name == "c1" &&
+      res.nodes[0].cpus == 2 && "debug" in res.nodes[0].partitions &&
+      res.nodes[0].state in ["IDLE", "MIXED", "ALLOCATED"]
+
+- name: Cleaned up after a run
+  id: cleanup
+  needs: [state]
+  steps:
+  # Probe is run again on a workflow that submits a job and leaves it. Its
+  # cleanup, once that run is over, cancels the job.
+  - name: A run leaves a job behind
+    uses: shell
+    with:
+      cmd: "{{vars.probe}} --allow-host localhost e2e/leave.yml"
+      env:
+        E2E_PORT: "{{vars.port}}"
+        E2E_WORK: "{{vars.work}}"
+      timeout: 120s
+    test: res.code == 0
+    echo: "{{res.stdout}}{{res.stderr}}"
+
+  - name: Its cleanup cancelled the job
+    uses: slurm
+    with:
+      host: localhost
+      port: "{{vars.port}}"
+      user: probe
+      key_file: "{{vars.work}}/id_ed25519"
+      known_hosts: "{{vars.work}}/known_hosts"
+      jobs:
+        name: left-behind
+        state: cancelled
+    test: status == 0 && res.count == 1
+
+- name: Under the guard
+  id: guard
+  needs: [cleanup]
+  steps:
+  # Probe is run again, read-only, on a workflow that reads and then
+  # submits. A step the guard refuses ends that run with the exit code 2.
+  - name: Reads are run and a submit is refused
+    uses: shell
+    with:
+      cmd: "{{vars.probe}} --read-only --allow-host localhost:{{vars.port}} e2e/read-only.yml"
+      env:
+        E2E_PORT: "{{vars.port}}"
+        E2E_WORK: "{{vars.work}}"
+      timeout: 120s
+    test: |
+      res.code == 2 &&
+      (res.stdout + res.stderr) contains "submit changes what Slurm holds, and the run is read-only"
+    echo: "{{res.stdout}}{{res.stderr}}"
+
+  - name: A host the run does not allow is refused
+    uses: shell
+    with:
+      cmd: "{{vars.probe}} --allow-host example.com e2e/read-only.yml"
+      env:
+        E2E_PORT: "{{vars.port}}"
+        E2E_WORK: "{{vars.work}}"
+      timeout: 120s
+    test: |
+      res.code == 2 &&
+      (res.stdout + res.stderr) contains "is not one the run allows"
+    echo: "{{res.stdout}}{{res.stderr}}"

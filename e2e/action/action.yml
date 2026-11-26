@@ -1,0 +1,14 @@
+# probe-slurm built from this checkout, for e2e/workflow.yml. Probe resolves
+# an action before the first job starts, so the executable is built before
+# probe runs:
+#
+#   go build -o e2e/action/probe-slurm . && probe --allow-host localhost --allow-action shell e2e/workflow.yml
+name: slurm
+description: Submit, watch and cancel jobs of Slurm, and read the state of its partitions and nodes, on a login node over SSH or on the host Probe runs on
+guard: [read-only, allow-host]
+params: [submit, job, jobs, cancel, partitions, nodes, wait, poll, output, host, port, user, key_file, key_passphrase, known_hosts, bin_dir, timeout]
+res: [job_id, cluster, error, name, user, account, partition, state, reason, nodes, exit_code, signal, submit_time, start_time, end_time, wait_sec, elapsed_sec, stdout_path, done, stdout, stdout_truncated, jobs, count, cancelled, partitions]
+cleanup: true
+runs:
+  using: binary
+  path: probe-slurm

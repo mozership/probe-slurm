@@ -1,0 +1,24 @@
+{
+  "jobs": [
+    {
+      "account": "lab",
+      "job_id": 7,
+      "name": "old",
+      "user_name": "probe",
+      "partition": "debug",
+      "job_state": "FAILED",
+      "state_reason": "NonZeroExitCode",
+      "nodes": "c2",
+      "comment": "",
+      "submit_time": 1764000000,
+      "start_time": 1764000010,
+      "end_time": 1764000070,
+      "exit_code": {"status": "FAILED", "return_code": 3, "signal": {"signal_id": 0, "name": ""}},
+      "standard_output": "/home/probe/out.txt",
+      "current_working_directory": "/home/probe",
+      "array_job_id": 0,
+      "array_task_id": null
+    }
+  ],
+  "errors": []
+}

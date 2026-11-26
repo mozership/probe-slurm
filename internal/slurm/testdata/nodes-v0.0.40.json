@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {"name": "c1", "state": ["IDLE"], "partitions": ["debug", "long"], "reason": "", "cpus": 4, "alloc_cpus": 0},
+    {"name": "c2", "state": ["MIXED"], "partitions": ["debug"], "reason": "", "cpus": 4, "alloc_cpus": 2},
+    {"name": "c3", "state": ["IDLE", "DRAIN"], "partitions": ["debug"], "reason": "disk", "cpus": 4, "alloc_cpus": 0},
+    {"name": "c4", "state": ["DOWN", "DRAIN", "NOT_RESPONDING"], "partitions": ["debug"], "reason": "gone", "cpus": 4, "alloc_cpus": 0},
+    {"name": "c5", "state": ["ALLOCATED"], "partitions": ["long"], "reason": "", "cpus": 4, "alloc_cpus": 4}
+  ],
+  "errors": []
+}

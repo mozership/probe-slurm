@@ -1,0 +1,12 @@
+name: slurm
+description: Submit, watch and cancel jobs of Slurm, and read the state of its partitions and nodes, on a login node over SSH or on the host Probe runs on
+guard: [read-only, allow-host]
+params: [submit, job, jobs, cancel, partitions, nodes, wait, poll, output, host, port, user, key_file, key_passphrase, known_hosts, bin_dir, timeout]
+res: [job_id, cluster, error, name, user, account, partition, state, reason, nodes, exit_code, signal, submit_time, start_time, end_time, wait_sec, elapsed_sec, stdout_path, done, stdout, stdout_truncated, jobs, count, cancelled, partitions]
+cleanup: true
+runs:
+  using: binary
+  # probe manifest <tag> <checksums-file> puts the tag of a release here and
+  # the digests of its executables in checksums. The release must publish
+  # the executable of each platform under this name.
+  url: https://github.com/mozership/probe-slurm/releases/download/v0.0.0/probe-slurm_{os}_{arch}

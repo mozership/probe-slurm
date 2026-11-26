@@ -1,0 +1,7 @@
+{
+  "partitions": [
+    {"name": "debug", "partition": {"state": ["UP"]}, "nodes": {"allowed_allocation": "", "configured": "c[1-4]", "total": 4}},
+    {"name": "long", "partition": {"state": ["DRAIN"]}, "nodes": {"allowed_allocation": "", "configured": "c[1,5]", "total": 2}}
+  ],
+  "errors": []
+}
