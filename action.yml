@@ -6,7 +6,9 @@ res: [job_id, cluster, error, name, user, account, partition, state, reason, nod
 cleanup: true
 runs:
   using: binary
-  # probe manifest <tag> <checksums-file> puts the tag of a release here and
-  # the digests of its executables in checksums. The release must publish
-  # the executable of each platform under this name.
-  url: https://github.com/mozership/probe-slurm/releases/download/v0.0.0/probe-slurm_{os}_{arch}
+  url: https://github.com/mozership/probe-slurm/releases/download/v0.1.0/probe-slurm_{os}_{arch}
+  checksums:
+    darwin_amd64: "60d1112996f177c05da3dd0ea675b603ed18d7802884acd735c42cf372335fed"
+    darwin_arm64: "aa94a9f35227d0de3e98e468f34bc4a8b3ff5bc76ebd6ead402fadde80edc796"
+    linux_amd64: "6c69d1516bb10818302b9acea09b5f7b92c6e6dc47cbb945e61532dcfa92a616"
+    linux_arm64: "09c7db6e31331bb102b34dbd93cd1967012687dd326d7c300d3b23889512518a"
