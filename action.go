@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -38,7 +41,7 @@ var writes = []string{opSubmit, opCancel}
 // jobParams are the keys of with that only job reads.
 var jobParams = []string{"wait", "poll", "output"}
 
-var commonParams = []string{"host", "port", "user", "key_file", "key_passphrase", "known_hosts", "bin_dir", "timeout"}
+var commonParams = []string{"host", "port", "user", "key_file", "key_passphrase", "known_hosts", "bin_dir", "endpoint", "token", "timeout"}
 
 // params are the keys the action takes in with, as action.yml declares
 // them.
@@ -48,8 +51,8 @@ var params = slices.Concat(operations, jobParams, commonParams)
 // them.
 var keeps = []string{sdk.KindReadOnly, sdk.KindAllowHost}
 
-// Action runs the commands of Slurm for a step, on a login node over SSH
-// or on the host Probe runs on.
+// Action asks Slurm for a step: by its commands, on a login node over SSH
+// or on the host Probe runs on, or by slurmrestd.
 type Action struct {
 	log hclog.Logger
 	// getenv reads the environment. It defaults to os.Getenv.
@@ -59,6 +62,9 @@ type Action struct {
 	// dial returns the runner for a connection. It defaults to a local
 	// runner without a host, and an SSH one with.
 	dial func(ctx context.Context, c connection, getenv func(string) string) (runner.Runner, error)
+	// http sends the requests to slurmrestd. It defaults to a client of
+	// its own.
+	http *http.Client
 	// ledgerDir is where the jobs a run submitted are noted for its
 	// cleanup. It defaults to probe-slurm under os.TempDir.
 	ledgerDir string
@@ -77,15 +83,21 @@ func (a *Action) init() {
 	if a.dial == nil {
 		a.dial = dial
 	}
+	if a.http == nil {
+		a.http = &http.Client{}
+	}
 	if a.ledgerDir == "" {
 		a.ledgerDir = defaultLedgerDir()
 	}
 }
 
-// connection says where the commands run: on a login node, or on this
-// host when Host is empty. It is noted for the cleanup of a run without
-// the passphrase of the key.
+// connection says how Slurm is asked: by slurmrestd at Endpoint, or by its
+// commands on a login node, or on this host when Host is empty too. It is
+// noted for the cleanup of a run without the passphrase of the key or the
+// token.
 type connection struct {
+	Endpoint      string `json:"endpoint,omitempty"`
+	Token         string `json:"-"`
 	Host          string `json:"host,omitempty"`
 	Port          int    `json:"port,omitempty"`
 	User          string `json:"user,omitempty"`
@@ -101,6 +113,47 @@ func (c connection) ssh() runner.SSHConfig {
 		KeyFile: c.KeyFile, KeyPassphrase: c.KeyPassphrase, KnownHosts: c.KnownHosts,
 		ClientVersion: "SSH-2.0-probe-slurm_" + version,
 	}
+}
+
+// where is what a message tells the connection by.
+func (c connection) where() string {
+	switch {
+	case c.Endpoint != "":
+		return c.Endpoint
+	case c.Host != "":
+		return c.ssh().Address()
+	}
+	return "this host"
+}
+
+// endpointAddress is the host and port of the endpoint, as the guard takes
+// them.
+func (c connection) endpointAddress() string {
+	u, err := url.Parse(c.Endpoint)
+	if err != nil {
+		return c.Endpoint
+	}
+	if u.Port() != "" {
+		return u.Host
+	}
+	port := "80"
+	if u.Scheme == "https" {
+		port = "443"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// backend returns how Slurm is asked over the connection, and what closes
+// it.
+func (a *Action) backend(ctx context.Context, c connection) (slurm.Backend, func(), error) {
+	if c.Endpoint != "" {
+		return &slurm.REST{URL: c.Endpoint, Token: c.Token, User: c.User, UserAgent: "probe-slurm/" + version, HTTP: a.http}, func() {}, nil
+	}
+	r, err := a.dial(ctx, c, a.getenv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return slurm.CLI{Runner: r, BinDir: c.BinDir}, func() { _ = r.Close() }, nil
 }
 
 func dial(ctx context.Context, c connection, getenv func(string) string) (runner.Runner, error) {
@@ -136,12 +189,11 @@ func (a *Action) RunStep(call sdk.Call) (map[string]any, map[string]any, error) 
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	r, err := a.dial(ctx, s.conn, a.getenv)
+	client, closeBackend, err := a.backend(ctx, s.conn)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() { _ = r.Close() }()
-	client := slurm.Client{Runner: r, BinDir: s.conn.BinDir}
+	defer closeBackend()
 
 	req := s.req()
 	var res map[string]any
@@ -160,6 +212,7 @@ func (a *Action) RunStep(call sdk.Call) (map[string]any, map[string]any, error) 
 	case opNodes:
 		res, ok, err = a.nodes(ctx, client, s, req)
 	}
+	describe(client, req)
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("the step did not finish within its timeout of %s: %w", s.timeout, err)
 	}
@@ -174,12 +227,17 @@ func (a *Action) RunStep(call sdk.Call) (map[string]any, map[string]any, error) 
 	return ret, nil, nil
 }
 
+// secretParams are the keys of with that are never logged or told.
+var secretParams = []string{"key_passphrase", "token"}
+
 // withoutSecrets returns with as it can be logged, the passphrase of the
-// key replaced.
+// key and the token replaced.
 func withoutSecrets(with map[string]any) map[string]any {
 	out := maps.Clone(with)
-	if _, ok := out["key_passphrase"]; ok {
-		out["key_passphrase"] = "<redacted>"
+	for _, k := range secretParams {
+		if _, ok := out[k]; ok {
+			out[k] = "<redacted>"
+		}
 	}
 	return out
 }
@@ -191,8 +249,11 @@ func checkGuard(s step, g sdk.Guard) error {
 	if len(g.AllowHosts) == 0 {
 		return nil
 	}
+	if s.conn.Endpoint != "" {
+		return g.CheckHost(s.conn.endpointAddress())
+	}
 	if s.conn.Host == "" {
-		return sdk.Refuse("without host, the commands of Slurm reach whatever slurmctld this host is set up for, which --allow-host cannot check; give the login node as host")
+		return sdk.Refuse("without host, the commands of Slurm reach whatever slurmctld this host is set up for, which --allow-host cannot check; give the login node as host, or slurmrestd as endpoint")
 	}
 	return g.CheckHost(s.conn.ssh().Address())
 }

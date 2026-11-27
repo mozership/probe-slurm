@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -73,6 +75,11 @@ func parseStep(with map[string]any, getenv func(string) string) (step, error) {
 	if s.conn, err = parseConnection(with, getenv); err != nil {
 		return s, err
 	}
+	if s.conn.Endpoint != "" {
+		if err := restCanDo(with, s.op); err != nil {
+			return s, err
+		}
+	}
 
 	v := with[s.op]
 	switch s.op {
@@ -119,9 +126,40 @@ func parseStep(with map[string]any, getenv func(string) string) (step, error) {
 	return s, nil
 }
 
+// restCanDo refuses what slurmrestd cannot do, before anything is sent:
+// it reads no file of a job, takes no option of sbatch, and does not know
+// the home directory of the user to run a job in.
+func restCanDo(with map[string]any, op string) error {
+	if op == opJob {
+		if output, _ := optionalBool(with, "with.", "output"); output {
+			return errors.New("with.output reads the file of the job on the login node, which slurmrestd cannot; give host rather than endpoint to read it")
+		}
+	}
+	if op != opSubmit {
+		return nil
+	}
+	given, _ := with[opSubmit].(map[string]any)
+	if _, ok := given["options"]; ok {
+		return errors.New("with.submit.options are options of sbatch, which slurmrestd does not take")
+	}
+	if chdir, _ := optionalString(given, "with.submit.", "chdir"); chdir == "" {
+		return errors.New("with.submit.chdir is required with endpoint, as slurmrestd runs a job in no directory of its own; give a directory on the cluster, such as the home directory")
+	}
+	return nil
+}
+
 func parseConnection(with map[string]any, getenv func(string) string) (connection, error) {
 	var c connection
 	var err error
+	if c.Endpoint, err = optionalString(with, "with.", "endpoint"); err != nil {
+		return c, err
+	}
+	if c.Endpoint != "" {
+		return parseEndpoint(with, c, getenv)
+	}
+	if _, ok := with["token"]; ok {
+		return c, fmt.Errorf("with.token is for with.endpoint, which is not given")
+	}
 	if c.Host, err = optionalString(with, "with.", "host"); err != nil {
 		return c, err
 	}
@@ -178,6 +216,35 @@ func parseConnection(with map[string]any, getenv func(string) string) (connectio
 	return c, nil
 }
 
+// parseEndpoint reads where slurmrestd is, and the token to give it.
+func parseEndpoint(with map[string]any, c connection, getenv func(string) string) (connection, error) {
+	for _, k := range []string{"host", "port", "key_file", "key_passphrase", "known_hosts", "bin_dir"} {
+		if _, ok := with[k]; ok {
+			return c, fmt.Errorf("with.%s is for running the commands of Slurm, not for slurmrestd at with.endpoint", k)
+		}
+	}
+	u, err := url.Parse(c.Endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return c, fmt.Errorf("with.endpoint must be the URL of slurmrestd, such as http://slurm.example.com:6820, not %q", c.Endpoint)
+	}
+	c.Endpoint = strings.TrimRight(u.String(), "/")
+	if c.User, err = optionalString(with, "with.", "user"); err != nil {
+		return c, err
+	}
+	if c.Token, err = optionalString(with, "with.", "token"); err != nil {
+		return c, err
+	}
+	if c.Token == "" {
+		c.Token = getenv("SLURM_JWT")
+	}
+	// scontrol token prints SLURM_JWT=<token>, which is taken as it is.
+	c.Token = strings.TrimPrefix(strings.TrimSpace(c.Token), "SLURM_JWT=")
+	if c.Token == "" {
+		return c, errors.New("with.token is required with endpoint, as SLURM_JWT does not give one; scontrol token makes one")
+	}
+	return c, nil
+}
+
 // submitDefaultsOnly tells whether v is a submit without a script, as the
 // defaults of a job give the steps that do something else.
 func submitDefaultsOnly(v any) bool {
@@ -196,13 +263,12 @@ var submitKeys = []string{
 	"cpus_per_task", "mem", "gres", "chdir", "output", "error", "options", "keep",
 }
 
-// submitSpec is the job a step submits.
+// submitSpec is the job a step submits: its script is written in the
+// step, or read from file when the step runs.
 type submitSpec struct {
-	script  string
-	file    string
-	options []string
-	keep    bool
-	given   map[string]any
+	job  slurm.JobSpec
+	file string
+	keep bool
 }
 
 // DefaultJobName is the name of a job whose step names none.
@@ -210,7 +276,7 @@ const DefaultJobName = "probe"
 
 // slurmTime is a time limit as sbatch takes it: minutes, MM:SS, HH:MM:SS,
 // D-HH, D-HH:MM or D-HH:MM:SS.
-var slurmTime = regexp.MustCompile(`^(\d+-)?\d+(:\d+){0,2}$`)
+var slurmTime = regexp.MustCompile(`^(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?$`)
 
 func parseSubmit(v any) (submitSpec, error) {
 	sub := submitSpec{}
@@ -218,68 +284,65 @@ func parseSubmit(v any) (submitSpec, error) {
 	if !ok {
 		return sub, fmt.Errorf("with.submit must be an object of the job, such as {script: ..., partition: debug}, not %T", v)
 	}
-	sub.given = given
 	for k := range given {
 		if !slices.Contains(submitKeys, k) {
 			return sub, fmt.Errorf("with.submit takes %s, not %s", strings.Join(submitKeys, ", "), k)
 		}
 	}
-	var err error
-	if sub.script, err = optionalString(given, "with.submit.", "script"); err != nil {
-		return sub, err
-	}
-	if sub.file, err = optionalString(given, "with.submit.", "file"); err != nil {
-		return sub, err
-	}
-	if (sub.script == "") == (sub.file == "") {
-		return sub, fmt.Errorf("with.submit requires exactly one of script and file")
-	}
-
-	name, err := optionalString(given, "with.submit.", "name")
+	job := &sub.job
+	script, err := optionalString(given, "with.submit.", "script")
 	if err != nil {
 		return sub, err
 	}
-	if name == "" {
-		name = DefaultJobName
+	job.Script = []byte(script)
+	if sub.file, err = optionalString(given, "with.submit.", "file"); err != nil {
+		return sub, err
 	}
-	sub.options = append(sub.options, "--job-name="+name)
+	if (script == "") == (sub.file == "") {
+		return sub, fmt.Errorf("with.submit requires exactly one of script and file")
+	}
 
-	for _, k := range []struct{ key, flag string }{
-		{"partition", "--partition"}, {"account", "--account"}, {"qos", "--qos"},
-		{"mem", "--mem"}, {"gres", "--gres"}, {"chdir", "--chdir"},
-		{"output", "--output"}, {"error", "--error"},
+	for _, k := range []struct {
+		key string
+		dst *string
+	}{
+		{"name", &job.Name}, {"partition", &job.Partition}, {"account", &job.Account}, {"qos", &job.QOS},
+		{"mem", &job.Mem}, {"gres", &job.Gres}, {"chdir", &job.Chdir}, {"output", &job.Output}, {"error", &job.Error},
 	} {
-		s, err := optionalString(given, "with.submit.", k.key)
-		if err != nil {
+		if *k.dst, err = optionalString(given, "with.submit.", k.key); err != nil {
 			return sub, err
 		}
-		if s != "" {
-			sub.options = append(sub.options, k.flag+"="+s)
+	}
+	if job.Name == "" {
+		job.Name = DefaultJobName
+	}
+	if job.Mem != "" {
+		if _, err := slurm.ParseMem(job.Mem); err != nil {
+			return sub, fmt.Errorf("with.submit.mem: %w", err)
 		}
 	}
 
 	if v, ok := given["time"]; ok {
-		limit, err := parseTimeLimit(v)
-		if err != nil {
+		if job.TimeLimit, err = parseTimeLimit(v); err != nil {
 			return sub, err
 		}
-		sub.options = append(sub.options, "--time="+limit)
 	}
 	if v, ok := given["nodes"]; ok {
-		var nodes string
 		switch n := v.(type) {
 		case string:
-			nodes = n
+			job.Nodes = n
 		default:
 			i, err := toInt(v, "with.submit.nodes")
 			if err != nil {
 				return sub, err
 			}
-			nodes = strconv.FormatInt(i, 10)
+			job.Nodes = strconv.FormatInt(i, 10)
 		}
-		sub.options = append(sub.options, "--nodes="+nodes)
 	}
-	for _, k := range []struct{ key, flag string }{{"ntasks", "--ntasks"}, {"cpus_per_task", "--cpus-per-task"}} {
+	for _, k := range []struct {
+		key string
+		dst *int64
+	}{{"ntasks", &job.NTasks}, {"cpus_per_task", &job.CPUsPerTask}} {
 		v, ok := given[k.key]
 		if !ok {
 			continue
@@ -291,7 +354,7 @@ func parseSubmit(v any) (submitSpec, error) {
 		if i < 1 {
 			return sub, fmt.Errorf("with.submit.%s must be 1 or more, not %d", k.key, i)
 		}
-		sub.options = append(sub.options, k.flag+"="+strconv.FormatInt(i, 10))
+		*k.dst = i
 	}
 	if v, ok := given["options"]; ok {
 		list, ok := v.([]any)
@@ -303,7 +366,7 @@ func parseSubmit(v any) (submitSpec, error) {
 			if !ok || !strings.HasPrefix(s, "-") {
 				return sub, fmt.Errorf("with.submit.options must be options of sbatch, each starting with -, not %v", o)
 			}
-			sub.options = append(sub.options, s)
+			job.Options = append(job.Options, s)
 		}
 	}
 	if sub.keep, err = optionalBool(given, "with.submit.", "keep"); err != nil {
@@ -312,38 +375,54 @@ func parseSubmit(v any) (submitSpec, error) {
 	return sub, nil
 }
 
-// parseTimeLimit reads a time limit: a duration such as 1h30m, which is
-// rounded up to whole minutes, a string as sbatch takes it, or a number of
-// minutes, as sbatch reads one.
-func parseTimeLimit(v any) (string, error) {
+// parseTimeLimit reads a time limit into minutes: a duration such as
+// 1h30m, a time as sbatch takes it such as 1-12:00:00, or a number of
+// minutes, as sbatch reads one. Seconds are rounded up to a minute.
+func parseTimeLimit(v any) (int64, error) {
 	if s, ok := v.(string); ok {
 		if d, err := time.ParseDuration(s); err == nil {
 			if d <= 0 {
-				return "", fmt.Errorf("with.submit.time must be longer than 0, not %s", s)
+				return 0, fmt.Errorf("with.submit.time must be longer than 0, not %s", s)
 			}
-			return formatMinutes(int64(math.Ceil(d.Minutes()))), nil
+			return int64(math.Ceil(d.Minutes())), nil
 		}
-		if slurmTime.MatchString(s) {
-			return s, nil
+		if m := slurmTime.FindStringSubmatch(s); m != nil {
+			minutes := slurmTimeMinutes(m)
+			if minutes <= 0 {
+				return 0, fmt.Errorf("with.submit.time must be longer than 0, not %s", s)
+			}
+			return minutes, nil
 		}
-		return "", fmt.Errorf("with.submit.time must be a duration such as 1h30m, or a time as sbatch takes it such as 1:30:00, not %q", s)
+		return 0, fmt.Errorf("with.submit.time must be a duration such as 1h30m, or a time as sbatch takes it such as 1:30:00, not %q", s)
 	}
 	minutes, err := toInt(v, "with.submit.time")
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	if minutes <= 0 {
-		return "", fmt.Errorf("with.submit.time must be longer than 0, not %d", minutes)
+		return 0, fmt.Errorf("with.submit.time must be longer than 0, not %d", minutes)
 	}
-	return formatMinutes(minutes), nil
+	return minutes, nil
 }
 
-func formatMinutes(m int64) string {
-	days, m := m/(24*60), m%(24*60)
-	if days > 0 {
-		return fmt.Sprintf("%d-%02d:%02d:00", days, m/60, m%60)
+// slurmTimeMinutes reads the parts of a time sbatch takes as slurmTime
+// matched them: with days, they are D-HH[:MM[:SS]], and without,
+// MM[:SS] or HH:MM:SS.
+func slurmTimeMinutes(m []string) int64 {
+	n := func(s string) int64 {
+		i, _ := strconv.ParseInt(s, 10, 64)
+		return i
 	}
-	return fmt.Sprintf("%02d:%02d:00", m/60, m%60)
+	var seconds int64
+	switch {
+	case m[1] != "":
+		seconds = n(m[1])*86400 + n(m[2])*3600 + n(m[3])*60 + n(m[4])
+	case m[4] != "":
+		seconds = n(m[2])*3600 + n(m[3])*60 + n(m[4])
+	default:
+		seconds = n(m[2])*60 + n(m[3])
+	}
+	return (seconds + 59) / 60
 }
 
 // filterKeys are the keys of with.jobs.

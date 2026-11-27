@@ -29,7 +29,7 @@ func (f *fakeRunner) Run(_ context.Context, argv []string, stdin []byte) (runner
 
 func (f *fakeRunner) Close() error { return nil }
 
-func TestClient_Submit(t *testing.T) {
+func TestCLI_Submit(t *testing.T) {
 	tests := []struct {
 		name        string
 		out         runner.Output
@@ -46,8 +46,8 @@ func TestClient_Submit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &fakeRunner{answers: map[string]runner.Output{"/opt/slurm/bin/sbatch": tt.out}}
-			c := Client{Runner: f, BinDir: "/opt/slurm/bin"}
-			id, cluster, err := c.Submit(context.Background(), []string{"--partition=debug"}, []byte("#!/bin/sh\n"))
+			c := CLI{Runner: f, BinDir: "/opt/slurm/bin"}
+			id, cluster, err := c.Submit(context.Background(), JobSpec{Script: []byte("#!/bin/sh\n"), Partition: "debug"})
 			var refused *Refusal
 			switch {
 			case tt.refusal != "":
@@ -72,7 +72,23 @@ func TestClient_Submit(t *testing.T) {
 	}
 }
 
-func TestClient_Job(t *testing.T) {
+func TestSubmitArgs(t *testing.T) {
+	got := SubmitArgs(JobSpec{
+		Name: "probe", Partition: "debug", Account: "lab", QOS: "high", TimeLimit: 24*60 + 90,
+		Nodes: "1-4", NTasks: 8, CPUsPerTask: 2, Mem: "4G", Gres: "gpu:1", Chdir: "/scratch",
+		Output: "o-%j", Error: "e-%j", Options: []string{"--exclusive"}, Environment: []string{"A=b"},
+	})
+	want := []string{
+		"sbatch", "--parsable", "--job-name=probe", "--partition=debug", "--account=lab", "--qos=high",
+		"--mem=4G", "--gres=gpu:1", "--chdir=/scratch", "--output=o-%j", "--error=e-%j",
+		"--time=1-01:30:00", "--nodes=1-4", "--ntasks=8", "--cpus-per-task=2", "--exclusive",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SubmitArgs() = %q, want %q", got, want)
+	}
+}
+
+func TestCLI_Job(t *testing.T) {
 	queue := runner.Output{Stdout: fixture(t, "squeue-v0.0.40.json")}
 	gone := runner.Output{Code: 1, Stdout: fixture(t, "squeue-invalid.json")}
 	acct := runner.Output{Stdout: fixture(t, "sacct-v0.0.40.json")}
@@ -98,7 +114,7 @@ func TestClient_Job(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &fakeRunner{answers: map[string]runner.Output{"squeue": tt.squeue, "sacct": tt.sacct}}
-			j, err := Client{Runner: f}.Job(context.Background(), tt.id)
+			j, err := CLI{Runner: f}.Job(context.Background(), tt.id)
 			if tt.errContains != "" {
 				if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), tt.errContains) {
 					t.Fatalf("Job() error = %v, want %q", err, tt.errContains)
@@ -115,9 +131,9 @@ func TestClient_Job(t *testing.T) {
 	}
 }
 
-func TestClient_Jobs(t *testing.T) {
+func TestCLI_Jobs(t *testing.T) {
 	f := &fakeRunner{answers: map[string]runner.Output{"squeue": {Stdout: fixture(t, "squeue-v0.0.40.json")}}}
-	jobs, err := Client{Runner: f}.Jobs(context.Background(), Filter{User: "probe", State: "pending"})
+	jobs, err := CLI{Runner: f}.Jobs(context.Background(), Filter{User: "probe", State: "pending"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +146,7 @@ func TestClient_Jobs(t *testing.T) {
 	}
 }
 
-func TestClient_Cancel(t *testing.T) {
+func TestCLI_Cancel(t *testing.T) {
 	running := runner.Output{Stdout: fixture(t, "squeue-v0.0.40.json")}
 	tests := []struct {
 		name      string
@@ -149,7 +165,7 @@ func TestClient_Cancel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &fakeRunner{answers: map[string]runner.Output{"squeue": running, "scancel": tt.scancel}}
-			j, cancelled, err := Client{Runner: f}.Cancel(context.Background(), tt.id)
+			j, cancelled, err := CLI{Runner: f}.Cancel(context.Background(), tt.id)
 			var refusal *Refusal
 			if errors.As(err, &refusal) != tt.refused || (err != nil && !tt.refused) {
 				t.Fatalf("Cancel() error = %v", err)
@@ -161,16 +177,16 @@ func TestClient_Cancel(t *testing.T) {
 	}
 
 	f := &fakeRunner{answers: map[string]runner.Output{"squeue": running, "sacct": {Code: 1, Stderr: []byte("Slurm accounting storage is disabled")}}}
-	if _, _, err := (Client{Runner: f}).Cancel(context.Background(), 99); !errors.Is(err, ErrNotFound) {
+	if _, _, err := (CLI{Runner: f}).Cancel(context.Background(), 99); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Cancel() of an unknown job: %v", err)
 	}
 }
 
-func TestClient_CancelAll(t *testing.T) {
+func TestCLI_CancelAll(t *testing.T) {
 	f := &fakeRunner{answers: map[string]runner.Output{"scancel": {Code: 1, Stderr: []byte(
 		"scancel: error: Kill job error on job id 5: Job/step already completing or completed\n" +
 			"scancel: error: Kill job error on job id 6: Invalid job id specified\n")}}}
-	if err := (Client{Runner: f}).CancelAll(context.Background(), []int64{5, 6, 7}); err != nil {
+	if err := (CLI{Runner: f}).CancelAll(context.Background(), []int64{5, 6, 7}); err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"scancel", "5", "6", "7"}; !reflect.DeepEqual(f.ran[0], want) {
@@ -178,14 +194,14 @@ func TestClient_CancelAll(t *testing.T) {
 	}
 
 	f.answers["scancel"] = runner.Output{Code: 1, Stderr: []byte("scancel: error: Access/permission denied\n")}
-	if err := (Client{Runner: f}).CancelAll(context.Background(), []int64{8}); err == nil || !strings.Contains(err.Error(), "permission denied") {
+	if err := (CLI{Runner: f}).CancelAll(context.Background(), []int64{8}); err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("CancelAll() error = %v", err)
 	}
 }
 
-func TestClient_Partitions(t *testing.T) {
+func TestCLI_Partitions(t *testing.T) {
 	r := &byArgs{answers: map[string][]byte{"partition": fixture(t, "partitions-v0.0.40.json"), "node": fixture(t, "nodes-v0.0.40.json")}}
-	got, err := Client{Runner: r}.Partitions(context.Background(), "long")
+	got, err := CLI{Runner: r}.Partitions(context.Background(), "long")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +210,7 @@ func TestClient_Partitions(t *testing.T) {
 		t.Errorf("Partitions() = %+v, want %+v", got, want)
 	}
 
-	if _, err := (Client{Runner: r}).Partitions(context.Background(), "nope"); err == nil || !strings.Contains(err.Error(), "no partition nope") {
+	if _, err := (CLI{Runner: r}).Partitions(context.Background(), "nope"); err == nil || !strings.Contains(err.Error(), "no partition nope") {
 		t.Errorf("Partitions() error = %v", err)
 	}
 }
@@ -210,9 +226,9 @@ func (b *byArgs) Run(_ context.Context, argv []string, _ []byte) (runner.Output,
 
 func (b *byArgs) Close() error { return nil }
 
-func TestClient_ReadFile(t *testing.T) {
+func TestCLI_ReadFile(t *testing.T) {
 	f := &fakeRunner{answers: map[string]runner.Output{"head": {Stdout: []byte("12345")}}}
-	out, truncated, err := Client{Runner: f, BinDir: "/opt/slurm/bin"}.ReadFile(context.Background(), "/home/a b.out", 4)
+	out, truncated, err := CLI{Runner: f, BinDir: "/opt/slurm/bin"}.ReadFile(context.Background(), "/home/a b.out", 4)
 	if err != nil {
 		t.Fatal(err)
 	}

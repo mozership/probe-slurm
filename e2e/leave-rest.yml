@@ -1,0 +1,25 @@
+# Run by e2e/workflow.yml against the slurmrestd of the cluster it started,
+# with SLURM_JWT set: submits a job and leaves it running, for the cleanup
+# of the run to cancel.
+name: probe-slurm leaves a job behind in slurmrestd
+
+actions:
+  slurm: ./action
+
+vars:
+  rest_port: "{{E2E_REST_PORT}}"
+
+jobs:
+- name: Leave a job
+  steps:
+  - name: Submit a job that sleeps
+    uses: slurm
+    with:
+      endpoint: "http://localhost:{{vars.rest_port}}"
+      submit:
+        name: left-behind-rest
+        chdir: /home/probe
+        script: |
+          #!/bin/sh
+          sleep 300
+    test: status == 0 && res.job_id > 0

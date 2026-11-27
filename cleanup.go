@@ -13,9 +13,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
-	"github.com/mozership/probe-slurm/internal/slurm"
 	"github.com/mozership/probe/sdk"
 )
 
@@ -46,7 +46,7 @@ func (a *Action) ledger(runID string) string {
 
 // note notes the job for the cleanup of the run. The passphrase of the key
 // is not noted, so a key that needs one is left to the agent or the
-// default keys then.
+// default keys then, nor is the token, which is read from SLURM_JWT then.
 func (a *Action) note(call sdk.Call, c connection, id int64) error {
 	if call.Step.RunID == "" {
 		return errors.New("the run has no ID, as a Probe from before cleanups gives none")
@@ -109,16 +109,18 @@ func (a *Action) Cleanup(call sdk.CleanupCall) error {
 }
 
 func (a *Action) cancelAll(ctx context.Context, c connection, ids []int64) error {
-	where := "this host"
-	if c.Host != "" {
-		where = c.ssh().Address()
+	where := c.where()
+	if c.Endpoint != "" {
+		c.Token = strings.TrimPrefix(strings.TrimSpace(a.getenv("SLURM_JWT")), "SLURM_JWT=")
+		if c.Token == "" {
+			return fmt.Errorf("jobs %v at %s are left in Slurm: the token is not noted, and SLURM_JWT gives none to cancel them with", ids, where)
+		}
 	}
-	r, err := a.dial(ctx, c, a.getenv)
+	client, closeBackend, err := a.backend(ctx, c)
 	if err != nil {
 		return fmt.Errorf("jobs %v on %s are left in Slurm: %w", ids, where, err)
 	}
-	defer func() { _ = r.Close() }()
-	client := slurm.Client{Runner: r, BinDir: c.BinDir}
+	defer closeBackend()
 	if err := client.CancelAll(ctx, ids); err != nil {
 		return fmt.Errorf("jobs %v on %s may be left in Slurm: %w", ids, where, err)
 	}

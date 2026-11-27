@@ -1,0 +1,40 @@
+{
+  "status": [
+    {
+      "error": {
+        "string": "Invalid job id specified",
+        "code": 2017,
+        "message": "Invalid job id specified"
+      },
+      "step_id": "999",
+      "job_id": {
+        "set": false,
+        "infinite": false,
+        "number": 0
+      },
+      "federation": {
+        "sibling": ""
+      }
+    }
+  ],
+  "meta": {
+    "plugin": {
+      "type": "openapi/slurmctld",
+      "name": "Slurm OpenAPI slurmctld",
+      "data_parser": "data_parser/v0.0.42",
+      "accounting_storage": ""
+    },
+    "command": [],
+    "slurm": {
+      "version": {
+        "major": "24",
+        "micro": "5",
+        "minor": "11"
+      },
+      "release": "24.11.5",
+      "cluster": "probe"
+    }
+  },
+  "errors": [],
+  "warnings": []
+}
