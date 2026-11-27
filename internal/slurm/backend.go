@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -81,6 +82,9 @@ func FormatMinutes(m int64) string {
 	return fmt.Sprintf("%02d:%02d:00", m/60, m%60)
 }
 
+// MaxMemMB bounds the memory of a job, at an exbibyte.
+const MaxMemMB = 1 << 40
+
 // ParseMem reads memory as sbatch takes it, a number with K, M, G or T, or
 // megabytes without, into megabytes, rounded up.
 func ParseMem(s string) (int64, error) {
@@ -93,10 +97,10 @@ func ParseMem(s string) (int64, error) {
 		}
 	}
 	n, err := strconv.ParseFloat(t, 64)
-	if err != nil || n < 0 {
+	mb := n * factor
+	if err != nil || n < 0 || math.IsNaN(mb) || math.IsInf(mb, 0) || mb > MaxMemMB {
 		return 0, fmt.Errorf("memory must be a number with K, M, G or T, such as 4G, not %q", s)
 	}
-	mb := n * factor
 	whole := int64(mb)
 	if float64(whole) < mb {
 		whole++

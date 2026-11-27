@@ -98,6 +98,45 @@ func TestREST_Submit(t *testing.T) {
 	}
 }
 
+func TestREST_SubmitAllMemory(t *testing.T) {
+	r, f := newREST(t, map[string]answer{"POST /slurm/v0.0.42/job/submit": {200, `{"job_id": 9, "errors": []}`}})
+	if _, _, err := r.Submit(context.Background(), JobSpec{Script: []byte("x"), Chdir: "/", Mem: "0"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.bodies[0], `"memory_per_node":0`) {
+		t.Errorf("body = %s", f.bodies[0])
+	}
+}
+
+func TestREST_NoRedirect(t *testing.T) {
+	var reached []string
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Header.Get("X-SLURM-USER-TOKEN"))
+	}))
+	t.Cleanup(other.Close)
+	r, _ := newREST(t, nil)
+	srv := httptest.NewServer(http.RedirectHandler(other.URL+"/slurm/v0.0.42/job/submit", http.StatusFound))
+	t.Cleanup(srv.Close)
+	r.URL = srv.URL
+	if _, _, err := r.Submit(context.Background(), JobSpec{Script: []byte("x"), Chdir: "/"}); err == nil || !strings.Contains(err.Error(), "slurmrestd answered 302") {
+		t.Errorf("Submit() error = %v", err)
+	}
+	if len(reached) != 0 {
+		t.Errorf("the redirect was followed, with the tokens %q", reached)
+	}
+}
+
+func TestREST_JobForgottenOtherwiseThan404(t *testing.T) {
+	r, _ := newREST(t, map[string]answer{
+		"GET /slurm/v0.0.39/job/42":   {500, `{"errors": [{"description": "Unable to query JobId=42", "error_number": 2017, "error": "Invalid job id specified"}]}`},
+		"GET /slurmdb/v0.0.39/job/42": {200, fixtureText(t, "sacct-v0.0.40.json")},
+	})
+	j, err := r.Job(context.Background(), 42)
+	if err != nil || j.ID != 42 {
+		t.Fatalf("Job() = %+v, %v", j, err)
+	}
+}
+
 func TestREST_SubmitRefused(t *testing.T) {
 	r, _ := newREST(t, map[string]answer{
 		"POST /slurm/v0.0.42/job/submit": {500, fixtureText(t, "rest-submit-refused-v0.0.42.json")},
@@ -284,6 +323,7 @@ func TestREST_NodesAndPartitions(t *testing.T) {
 		"GET /slurm/v0.0.42/nodes":      {200, fixtureText(t, "nodes-v0.0.42.json")},
 		"GET /slurm/v0.0.42/partitions": {200, fixtureText(t, "partitions-v0.0.42.json")},
 	})
+	// As scontrol, nodes the cluster does not have are left out.
 	nodes, err := r.Nodes(context.Background(), "c[1-3],nope")
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +372,8 @@ func TestParseMem(t *testing.T) {
 		err  bool
 	}{
 		{"512", 512, false}, {"512M", 512, false}, {"4G", 4096, false}, {"1.5g", 1536, false},
-		{"1T", 1 << 20, false}, {"100K", 1, false}, {"lots", 0, true}, {"-1G", 0, true},
+		{"1T", 1 << 20, false}, {"100K", 1, false}, {"0", 0, false}, {"lots", 0, true}, {"-1G", 0, true},
+		{"inf", 0, true}, {"NaN", 0, true}, {"1e30G", 0, true},
 	}
 	for _, tt := range tests {
 		got, err := ParseMem(tt.in)

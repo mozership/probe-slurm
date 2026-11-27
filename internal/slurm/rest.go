@@ -113,11 +113,7 @@ func (r *REST) send(ctx context.Context, method, path string, payload []byte) (r
 	if r.UserAgent != "" {
 		req.Header.Set("User-Agent", r.UserAgent)
 	}
-	client := r.HTTP
-	if client == nil {
-		client = http.DefaultClient
-	}
-	res, err := client.Do(req)
+	res, err := r.client().Do(req)
 	if err != nil {
 		return response{}, fmt.Errorf("failed to reach slurmrestd: %w", err)
 	}
@@ -134,6 +130,18 @@ func (r *REST) send(ctx context.Context, method, path string, payload []byte) (r
 		return out, fmt.Errorf("slurmrestd refused the token: %s %s", res.Status, snippet(b))
 	}
 	return out, nil
+}
+
+// client returns the HTTP client, made not to follow redirects: a redirect
+// would carry the token, a header of its own, to a host the guard did not
+// check, and turn a POST into a GET.
+func (r *REST) client() *http.Client {
+	c := http.Client{}
+	if r.HTTP != nil {
+		c = *r.HTTP
+	}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
 }
 
 func snippet(b []byte) string {
@@ -179,7 +187,7 @@ type jobDesc struct {
 	Nodes                   string   `json:"nodes,omitempty"`
 	Tasks                   int64    `json:"tasks,omitempty"`
 	CPUsPerTask             int64    `json:"cpus_per_task,omitempty"`
-	MemoryPerNode           int64    `json:"memory_per_node,omitempty"`
+	MemoryPerNode           *int64   `json:"memory_per_node,omitempty"`
 	TRESPerNode             string   `json:"tres_per_node,omitempty"`
 	CurrentWorkingDirectory string   `json:"current_working_directory"`
 	StandardOutput          string   `json:"standard_output,omitempty"`
@@ -227,7 +235,8 @@ func (r *REST) Submit(ctx context.Context, spec JobSpec) (int64, string, error) 
 		if err != nil {
 			return 0, "", err
 		}
-		desc.MemoryPerNode = mb
+		// 0 is all the memory of the node, as sbatch --mem=0 takes it.
+		desc.MemoryPerNode = &mb
 	}
 	body := map[string]any{"script": string(spec.Script), "job": desc}
 	res, err := r.do(ctx, http.MethodPost, "slurm", "/job/submit", body)
@@ -248,6 +257,15 @@ func (r *REST) Submit(ctx context.Context, spec JobSpec) (int64, string, error) 
 		return 0, "", r.failure(http.MethodPost, "slurm", "/job/submit", res)
 	}
 	return out.JobID.value(), "", nil
+}
+
+// hasError tells whether slurmrestd answered with the error of the code.
+func hasError(res response, code int) bool {
+	var rep reply
+	if !res.json() || json.Unmarshal(res.body, &rep) != nil {
+		return false
+	}
+	return slices.ContainsFunc(rep.Errors, func(e replyError) bool { return e.ErrorNumber == code })
 }
 
 func jobPath(id int64) string {
@@ -277,6 +295,12 @@ func (r *REST) Job(ctx context.Context, id int64) (Job, error) {
 	case http.StatusNotFound:
 		ctldErr = r.failure(http.MethodGet, "slurm", jobPath(id), res)
 	default:
+		// An older version may answer a job it has forgotten otherwise than
+		// with 404, telling it as an invalid job ID all the same.
+		if hasError(res, errInvalidJobID) {
+			ctldErr = r.failure(http.MethodGet, "slurm", jobPath(id), res)
+			break
+		}
 		return Job{}, r.failure(http.MethodGet, "slurm", jobPath(id), res)
 	}
 
@@ -405,7 +429,8 @@ func (r *REST) CancelAll(ctx context.Context, ids []int64) error {
 }
 
 // Nodes returns the nodes slurmctld knows, those of the host list alone
-// when one is given, as slurmrestd takes the name of one node only.
+// when one is given, as slurmrestd takes the name of one node only. A name
+// it does not know is left out, as scontrol leaves it.
 func (r *REST) Nodes(ctx context.Context, names string) ([]Node, error) {
 	var want []string
 	if names != "" {
