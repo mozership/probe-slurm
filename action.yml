@@ -6,9 +6,9 @@ res: [job_id, cluster, error, name, user, account, partition, state, reason, nod
 cleanup: true
 runs:
   using: binary
-  url: https://github.com/mozership/probe-slurm/releases/download/v0.1.0/probe-slurm_{os}_{arch}
+  url: https://github.com/mozership/probe-slurm/releases/download/v0.2.0/probe-slurm_{os}_{arch}
   checksums:
-    darwin_amd64: "60d1112996f177c05da3dd0ea675b603ed18d7802884acd735c42cf372335fed"
-    darwin_arm64: "aa94a9f35227d0de3e98e468f34bc4a8b3ff5bc76ebd6ead402fadde80edc796"
-    linux_amd64: "6c69d1516bb10818302b9acea09b5f7b92c6e6dc47cbb945e61532dcfa92a616"
-    linux_arm64: "09c7db6e31331bb102b34dbd93cd1967012687dd326d7c300d3b23889512518a"
+    darwin_amd64: "ef29673112fa68fa3ff82ad868fc7a4ccf3fd6f8481012e306196e8772a1bd87"
+    darwin_arm64: "e5900be5ac2c0e156b9e310bbdafa88a5af5630b984337519b34bf212ca93965"
+    linux_amd64: "3242c8b298c28ebd6fe051a976ecf7a352f3a0d5efbad78e131d5129448c9ed3"
+    linux_arm64: "c167bf8efcd2eca0e1263d0c5a6dda9aa17101cd16f9f9befb2cb5eb6c1c97d3"
