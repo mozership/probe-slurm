@@ -23,9 +23,20 @@ var resFields = []string{
 // OutputLimit is the most of the output of a job a step reads.
 const OutputLimit = 1 << 20
 
-// req is what the step did, as the result tells it: never the passphrase.
+// DefaultEnvironment is the environment of a job submitted to slurmrestd,
+// which exports none of its own, as sbatch exports that of the shell.
+var DefaultEnvironment = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
+
+// req is what the step did, as the result tells it: never the passphrase
+// or the token.
 func (s step) req() map[string]any {
 	req := map[string]any{"operation": s.op}
+	if s.conn.Endpoint != "" {
+		req["endpoint"] = s.conn.Endpoint
+		if s.conn.User != "" {
+			req["user"] = s.conn.User
+		}
+	}
 	if s.conn.Host != "" {
 		req["host"] = s.conn.Host
 		req["port"] = s.conn.Port
@@ -39,7 +50,7 @@ func (s step) req() map[string]any {
 		if s.submit.file != "" {
 			req["file"] = s.submit.file
 		} else {
-			req["script"] = s.submit.script
+			req["script"] = string(s.submit.job.Script)
 		}
 		req["keep"] = s.submit.keep
 	case opJob:
@@ -56,21 +67,36 @@ func (s step) req() map[string]any {
 	return req
 }
 
-func command(c slurm.Client, argv []string) string {
-	return runner.Quote(c.Command(argv))
+// command tells the command line the step ran, when it ran the commands
+// of Slurm.
+func command(b slurm.Backend, req map[string]any, argv []string) {
+	if c, ok := b.(slurm.CLI); ok {
+		req["command"] = runner.Quote(c.Command(argv))
+	}
 }
 
-func (a *Action) submit(ctx context.Context, c slurm.Client, s step, call sdk.Call, req map[string]any) (map[string]any, bool, error) {
-	script := []byte(s.submit.script)
+// describe tells the version of the API of slurmrestd the step asked it
+// by.
+func describe(b slurm.Backend, req map[string]any) {
+	if r, ok := b.(*slurm.REST); ok && r.Version() != "" {
+		req["api_version"] = r.Version()
+	}
+}
+
+func (a *Action) submit(ctx context.Context, c slurm.Backend, s step, call sdk.Call, req map[string]any) (map[string]any, bool, error) {
+	job := s.submit.job
 	if s.submit.file != "" {
 		var err error
-		if script, err = os.ReadFile(s.submit.file); err != nil {
+		if job.Script, err = os.ReadFile(s.submit.file); err != nil {
 			return nil, false, fmt.Errorf("failed to read with.submit.file: %w", err)
 		}
 	}
-	req["command"] = command(c, slurm.SubmitArgs(s.submit.options))
+	if s.conn.Endpoint != "" {
+		job.Environment = DefaultEnvironment
+	}
+	command(c, req, slurm.SubmitArgs(job))
 
-	id, cluster, err := c.Submit(ctx, s.submit.options, script)
+	id, cluster, err := c.Submit(ctx, job)
 	if refused, ok := errors.AsType[*slurm.Refusal](err); ok {
 		return map[string]any{"job_id": 0, "cluster": "", "error": refused.Message}, false, nil
 	}
@@ -85,8 +111,8 @@ func (a *Action) submit(ctx context.Context, c slurm.Client, s step, call sdk.Ca
 	return map[string]any{"job_id": id, "cluster": cluster, "error": ""}, true, nil
 }
 
-func (a *Action) job(ctx context.Context, c slurm.Client, s step, req map[string]any) (map[string]any, bool, error) {
-	req["command"] = command(c, slurm.QueueArgs(slurm.Filter{JobID: s.jobID}))
+func (a *Action) job(ctx context.Context, c slurm.Backend, s step, req map[string]any) (map[string]any, bool, error) {
+	command(c, req, slurm.QueueArgs(slurm.Filter{JobID: s.jobID}))
 	deadline := a.now().Add(s.wait)
 	var j slurm.Job
 	for {
@@ -115,7 +141,11 @@ func (a *Action) job(ctx context.Context, c slurm.Client, s step, req map[string
 			if j.StdoutPath == "" {
 				return nil, false, fmt.Errorf("slurm does not tell where job %d writes its output", j.ID)
 			}
-			out, truncated, err := c.ReadFile(ctx, j.StdoutPath, OutputLimit)
+			cli, ok := c.(slurm.CLI)
+			if !ok {
+				return nil, false, errors.New("only the commands of Slurm read the output of a job")
+			}
+			out, truncated, err := cli.ReadFile(ctx, j.StdoutPath, OutputLimit)
 			if err != nil {
 				return nil, false, err
 			}
@@ -125,8 +155,8 @@ func (a *Action) job(ctx context.Context, c slurm.Client, s step, req map[string
 	return res, j.State == "COMPLETED" && j.ExitCode == 0 && j.Signal == 0, nil
 }
 
-func (a *Action) jobs(ctx context.Context, c slurm.Client, s step, req map[string]any) (map[string]any, bool, error) {
-	req["command"] = command(c, slurm.QueueArgs(s.filter))
+func (a *Action) jobs(ctx context.Context, c slurm.Backend, s step, req map[string]any) (map[string]any, bool, error) {
+	command(c, req, slurm.QueueArgs(s.filter))
 	jobs, err := c.Jobs(ctx, s.filter)
 	if err != nil {
 		return nil, false, err
@@ -139,8 +169,8 @@ func (a *Action) jobs(ctx context.Context, c slurm.Client, s step, req map[strin
 	return map[string]any{"jobs": list, "count": len(list)}, true, nil
 }
 
-func (a *Action) cancel(ctx context.Context, c slurm.Client, s step, req map[string]any) (map[string]any, bool, error) {
-	req["command"] = command(c, slurm.CancelArgs(s.jobID))
+func (a *Action) cancel(ctx context.Context, c slurm.Backend, s step, req map[string]any) (map[string]any, bool, error) {
+	command(c, req, slurm.CancelArgs(s.jobID))
 	j, cancelled, err := c.Cancel(ctx, s.jobID)
 	if refused, ok := errors.AsType[*slurm.Refusal](err); ok {
 		return map[string]any{"job_id": s.jobID, "state": j.State, "cancelled": false, "error": refused.Message}, false, nil
@@ -151,8 +181,8 @@ func (a *Action) cancel(ctx context.Context, c slurm.Client, s step, req map[str
 	return map[string]any{"job_id": s.jobID, "state": j.State, "cancelled": cancelled, "error": ""}, true, nil
 }
 
-func (a *Action) partitions(ctx context.Context, c slurm.Client, s step, req map[string]any) (map[string]any, bool, error) {
-	req["command"] = command(c, slurm.PartitionsArgs(s.name))
+func (a *Action) partitions(ctx context.Context, c slurm.Backend, s step, req map[string]any) (map[string]any, bool, error) {
+	command(c, req, slurm.PartitionsArgs(s.name))
 	partitions, err := c.Partitions(ctx, s.name)
 	if err != nil {
 		return nil, false, err
@@ -168,8 +198,8 @@ func (a *Action) partitions(ctx context.Context, c slurm.Client, s step, req map
 	return map[string]any{"partitions": list, "count": len(list)}, true, nil
 }
 
-func (a *Action) nodes(ctx context.Context, c slurm.Client, s step, req map[string]any) (map[string]any, bool, error) {
-	req["command"] = command(c, slurm.NodesArgs(s.name))
+func (a *Action) nodes(ctx context.Context, c slurm.Backend, s step, req map[string]any) (map[string]any, bool, error) {
+	command(c, req, slurm.NodesArgs(s.name))
 	nodes, err := c.Nodes(ctx, s.name)
 	if err != nil {
 		return nil, false, err

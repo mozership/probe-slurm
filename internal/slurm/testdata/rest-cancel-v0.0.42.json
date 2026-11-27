@@ -1,0 +1,23 @@
+{
+  "status": [],
+  "meta": {
+    "plugin": {
+      "type": "openapi/slurmctld",
+      "name": "Slurm OpenAPI slurmctld",
+      "data_parser": "data_parser/v0.0.42",
+      "accounting_storage": ""
+    },
+    "command": [],
+    "slurm": {
+      "version": {
+        "major": "24",
+        "micro": "5",
+        "minor": "11"
+      },
+      "release": "24.11.5",
+      "cluster": "probe"
+    }
+  },
+  "errors": [],
+  "warnings": []
+}

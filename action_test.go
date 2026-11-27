@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -347,6 +350,15 @@ func TestParseStep_errors(t *testing.T) {
 		{"submit bad option", map[string]any{"submit": map[string]any{"script": "x", "options": []any{"exclusive"}}}, "each starting with -"},
 		{"jobs unknown key", map[string]any{"jobs": map[string]any{"queue": "x"}}, "with.jobs takes"},
 		{"nodes not a name", map[string]any{"nodes": 3}, "with.nodes must be a name"},
+		{"submit bad mem", map[string]any{"submit": map[string]any{"script": "x", "mem": "lots"}}, "with.submit.mem: memory must be"},
+		{"endpoint and host", map[string]any{"job": 1, "endpoint": "http://slurm:6820", "host": "login"}, "with.host is for running the commands of Slurm"},
+		{"endpoint and bin_dir", map[string]any{"job": 1, "endpoint": "http://slurm:6820", "bin_dir": "/opt/slurm/bin"}, "with.bin_dir is for running the commands"},
+		{"endpoint not a URL", map[string]any{"job": 1, "endpoint": "slurm:6820"}, "must be the URL of slurmrestd"},
+		{"endpoint with a query", map[string]any{"job": 1, "endpoint": "http://slurm:6820/?a=b"}, "must be the URL of slurmrestd"},
+		{"token without endpoint", map[string]any{"job": 1, "token": "x"}, "with.token is for with.endpoint"},
+		{"output by slurmrestd", map[string]any{"job": 1, "endpoint": "http://slurm:6820", "output": true}, "which slurmrestd cannot"},
+		{"options by slurmrestd", map[string]any{"endpoint": "http://slurm:6820", "submit": map[string]any{"script": "x", "chdir": "/", "options": []any{"--exclusive"}}}, "which slurmrestd does not take"},
+		{"no chdir by slurmrestd", map[string]any{"endpoint": "http://slurm:6820", "submit": map[string]any{"script": "x"}}, "with.submit.chdir is required with endpoint"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -361,18 +373,27 @@ func TestParseStep_errors(t *testing.T) {
 func TestParseTimeLimit(t *testing.T) {
 	tests := []struct {
 		in   any
-		want string
+		want int64
 	}{
-		{"90s", "00:02:00"},
-		{"25h", "1-01:00:00"},
-		{"1-12:00:00", "1-12:00:00"},
-		{"30", "30"},
-		{float64(45), "00:45:00"},
+		{"90s", 2},
+		{"25h", 25 * 60},
+		{"1-12:00:00", 36 * 60},
+		{"1-12", 36 * 60},
+		{"1-0:30", 24*60 + 30},
+		{"2:00:01", 121},
+		{"5:30", 6},
+		{"30", 30},
+		{float64(45), 45},
 	}
 	for _, tt := range tests {
 		got, err := parseTimeLimit(tt.in)
 		if err != nil || got != tt.want {
-			t.Errorf("parseTimeLimit(%v) = %q, %v, want %q", tt.in, got, err, tt.want)
+			t.Errorf("parseTimeLimit(%v) = %d, %v, want %d", tt.in, got, err, tt.want)
+		}
+	}
+	for _, in := range []any{"0", "0:00", "soon", float64(-1)} {
+		if got, err := parseTimeLimit(in); err == nil {
+			t.Errorf("parseTimeLimit(%v) = %d, want an error", in, got)
 		}
 	}
 }
@@ -421,10 +442,140 @@ func TestNote_passphrase(t *testing.T) {
 }
 
 func TestWithoutSecrets(t *testing.T) {
-	with := map[string]any{"key_passphrase": "secret", "job": 1}
+	with := map[string]any{"key_passphrase": "secret", "token": "jwt", "job": 1}
 	got := withoutSecrets(with)
-	if got["key_passphrase"] != "<redacted>" || with["key_passphrase"] != "secret" {
+	if got["key_passphrase"] != "<redacted>" || got["token"] != "<redacted>" || with["key_passphrase"] != "secret" || with["token"] != "jwt" {
 		t.Errorf("withoutSecrets() = %v", got)
+	}
+}
+
+func TestParseConnection_endpoint(t *testing.T) {
+	env := func(v string) func(string) string {
+		return func(k string) string {
+			if k == "SLURM_JWT" {
+				return v
+			}
+			return "alice"
+		}
+	}
+	c, err := parseConnection(map[string]any{"endpoint": "https://slurm.example.com/api/"}, env("SLURM_JWT=abc\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c != (connection{Endpoint: "https://slurm.example.com/api", Token: "abc"}) {
+		t.Errorf("parseConnection() = %+v", c)
+	}
+	if c.endpointAddress() != "slurm.example.com:443" {
+		t.Errorf("endpointAddress() = %s", c.endpointAddress())
+	}
+	c, err = parseConnection(map[string]any{"endpoint": "http://slurm:6820", "token": "given", "user": "bob"}, env("abc"))
+	if err != nil || c.Token != "given" || c.User != "bob" || c.endpointAddress() != "slurm:6820" {
+		t.Errorf("parseConnection() = %+v, %v", c, err)
+	}
+	if _, err := parseConnection(map[string]any{"endpoint": "http://slurm:6820"}, env("")); err == nil || !strings.Contains(err.Error(), "with.token is required with endpoint") {
+		t.Errorf("parseConnection() without a token error = %v", err)
+	}
+}
+
+// restd stands in for slurmrestd, answering "METHOD /path".
+func restd(t *testing.T, answers map[string]string) (*httptest.Server, *[]*http.Request) {
+	t.Helper()
+	var mu sync.Mutex
+	var requests []*http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r)
+		mu.Unlock()
+		body, ok := answers[r.Method+" "+r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, "Unable find requested URL.")
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+func TestRunStep_endpoint(t *testing.T) {
+	srv, requests := restd(t, map[string]string{
+		"POST /slurm/v0.0.42/job/submit": `{"job_id": 77, "errors": []}`,
+		"GET /slurm/v0.0.42/job/77":      string(queueJSON(77, "RUNNING", 0)),
+		"DELETE /slurm/v0.0.42/job/77":   `{"status": [], "errors": []}`,
+	})
+	c := &cluster{}
+	a := newAction(t, c)
+	a.http = srv.Client()
+	jwt := ""
+	a.getenv = func(k string) string {
+		if k == "SLURM_JWT" {
+			return jwt
+		}
+		return ""
+	}
+	ret, _, err := a.RunStep(sdk.Call{
+		With: map[string]any{
+			"endpoint": srv.URL,
+			"token":    "step-token",
+			"submit":   map[string]any{"script": "#!/bin/sh\ntrue\n", "chdir": "/home/alice", "time": "1:30:00"},
+		},
+		Step: sdk.Step{RunID: "run-rest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, req := ret["res"].(map[string]any), ret["req"].(map[string]any)
+	if res["job_id"] != int64(77) || ret["status"] != 0 {
+		t.Errorf("RunStep() = %v", ret)
+	}
+	if req["endpoint"] != srv.URL || req["api_version"] != "v0.0.42" || req["command"] != nil {
+		t.Errorf("req = %v", req)
+	}
+	if len(c.dialled) != 0 {
+		t.Errorf("dialled %+v", c.dialled)
+	}
+	if got := (*requests)[0].Header.Get("X-SLURM-USER-TOKEN"); got != "step-token" {
+		t.Errorf("sent the token %q", got)
+	}
+	entries, _ := os.ReadDir(a.ledgerDir)
+	b, err := os.ReadFile(filepath.Join(a.ledgerDir, entries[0].Name()))
+	if err != nil || strings.Contains(string(b), "step-token") || !strings.Contains(string(b), srv.URL) {
+		t.Errorf("noted %s, %v", b, err)
+	}
+
+	// Without SLURM_JWT, the cleanup has no token to cancel the job with.
+	if err := a.Cleanup(sdk.CleanupCall{RunID: "run-rest"}); err == nil || !strings.Contains(err.Error(), "jobs [77] at "+srv.URL+" are left") {
+		t.Fatalf("Cleanup() without SLURM_JWT error = %v", err)
+	}
+	_, _, err = a.RunStep(sdk.Call{
+		With: map[string]any{"endpoint": srv.URL, "token": "step-token", "submit": map[string]any{"script": "x", "chdir": "/"}},
+		Step: sdk.Step{RunID: "run-rest-2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt = "env-token"
+	if err := a.Cleanup(sdk.CleanupCall{RunID: "run-rest-2"}); err != nil {
+		t.Fatal(err)
+	}
+	last := (*requests)[len(*requests)-1]
+	if last.Method != http.MethodDelete || last.URL.Path != "/slurm/v0.0.42/job/77" || last.Header.Get("X-SLURM-USER-TOKEN") != "env-token" {
+		t.Errorf("cleanup sent %s %s with %q", last.Method, last.URL.Path, last.Header.Get("X-SLURM-USER-TOKEN"))
+	}
+}
+
+func TestCheckGuard_endpoint(t *testing.T) {
+	s := step{op: opJob, conn: connection{Endpoint: "https://slurm.example.com"}}
+	if err := checkGuard(s, sdk.Guard{AllowHosts: []string{"slurm.example.com:443"}}); err != nil {
+		t.Errorf("checkGuard() = %v", err)
+	}
+	if err := checkGuard(s, sdk.Guard{AllowHosts: []string{"login.example.com"}}); !sdk.IsRefused(err) {
+		t.Errorf("checkGuard() = %v, want a refusal", err)
+	}
+	s.op = opSubmit
+	if err := checkGuard(s, sdk.Guard{ReadOnly: true}); !sdk.IsRefused(err) {
+		t.Errorf("checkGuard() = %v, want a refusal", err)
 	}
 }
 

@@ -15,19 +15,17 @@ import (
 	"github.com/mozership/probe-slurm/internal/runner"
 )
 
-// Client runs the commands of Slurm by a runner.
-type Client struct {
+// CLI runs the commands of Slurm by a runner, on a login node or on the
+// host Probe runs on.
+type CLI struct {
 	Runner runner.Runner
 	// BinDir is the directory of the commands, or empty for the PATH to
 	// find them.
 	BinDir string
 }
 
-// ErrNotFound is the error of a job neither squeue nor sacct knows.
-var ErrNotFound = errors.New("job not found")
-
 // Command returns the command line of argv as the client runs it.
-func (c Client) Command(argv []string) []string {
+func (c CLI) Command(argv []string) []string {
 	out := slices.Clone(argv)
 	if c.BinDir != "" {
 		out[0] = path.Join(c.BinDir, out[0])
@@ -35,17 +33,9 @@ func (c Client) Command(argv []string) []string {
 	return out
 }
 
-func (c Client) run(ctx context.Context, argv []string, stdin []byte) (runner.Output, error) {
+func (c CLI) run(ctx context.Context, argv []string, stdin []byte) (runner.Output, error) {
 	return c.Runner.Run(ctx, c.Command(argv), stdin)
 }
-
-// Refusal is what Slurm said when it refused what it was asked, such as a
-// job for a partition that does not exist.
-type Refusal struct {
-	Message string
-}
-
-func (r *Refusal) Error() string { return r.Message }
 
 func message(out runner.Output) string {
 	msg := strings.TrimSpace(string(out.Stderr))
@@ -58,17 +48,41 @@ func message(out runner.Output) string {
 	return msg
 }
 
-// SubmitArgs are the arguments of sbatch for a job; the script is its
+// SubmitArgs are the arguments of sbatch for the job; its script is the
 // standard input.
-func SubmitArgs(options []string) []string {
-	return append([]string{"sbatch", "--parsable"}, options...)
+func SubmitArgs(spec JobSpec) []string {
+	argv := []string{"sbatch", "--parsable"}
+	if spec.Name != "" {
+		argv = append(argv, "--job-name="+spec.Name)
+	}
+	for _, o := range []struct{ flag, value string }{
+		{"--partition", spec.Partition}, {"--account", spec.Account}, {"--qos", spec.QOS},
+		{"--mem", spec.Mem}, {"--gres", spec.Gres}, {"--chdir", spec.Chdir},
+		{"--output", spec.Output}, {"--error", spec.Error},
+	} {
+		if o.value != "" {
+			argv = append(argv, o.flag+"="+o.value)
+		}
+	}
+	if spec.TimeLimit > 0 {
+		argv = append(argv, "--time="+FormatMinutes(spec.TimeLimit))
+	}
+	if spec.Nodes != "" {
+		argv = append(argv, "--nodes="+spec.Nodes)
+	}
+	if spec.NTasks > 0 {
+		argv = append(argv, "--ntasks="+strconv.FormatInt(spec.NTasks, 10))
+	}
+	if spec.CPUsPerTask > 0 {
+		argv = append(argv, "--cpus-per-task="+strconv.FormatInt(spec.CPUsPerTask, 10))
+	}
+	return append(argv, spec.Options...)
 }
 
-// Submit submits the script with the options of sbatch, and returns the ID
-// of the job and the cluster it went to, when sbatch names one. sbatch
-// refusing the job is a *Refusal.
-func (c Client) Submit(ctx context.Context, options []string, script []byte) (int64, string, error) {
-	out, err := c.run(ctx, SubmitArgs(options), script)
+// Submit submits the job with sbatch, which names the cluster it went to
+// when there are more than one.
+func (c CLI) Submit(ctx context.Context, spec JobSpec) (int64, string, error) {
+	out, err := c.run(ctx, SubmitArgs(spec), spec.Script)
 	if err != nil {
 		return 0, "", err
 	}
@@ -133,7 +147,7 @@ func (f Filter) Matches(j Job) bool {
 }
 
 // Jobs returns the jobs in the queue the filter names.
-func (c Client) Jobs(ctx context.Context, f Filter) ([]Job, error) {
+func (c CLI) Jobs(ctx context.Context, f Filter) ([]Job, error) {
 	out, err := c.run(ctx, QueueArgs(f), nil)
 	if err != nil {
 		return nil, err
@@ -149,8 +163,8 @@ func (c Client) Jobs(ctx context.Context, f Filter) ([]Job, error) {
 }
 
 // Job returns the job from squeue, or from sacct once slurmctld has
-// forgotten it. A job neither knows is ErrNotFound.
-func (c Client) Job(ctx context.Context, id int64) (Job, error) {
+// forgotten it.
+func (c CLI) Job(ctx context.Context, id int64) (Job, error) {
 	f := Filter{JobID: id}
 	out, err := c.run(ctx, QueueArgs(f), nil)
 	if err != nil {
@@ -204,11 +218,9 @@ func CancelArgs(ids ...int64) []string {
 	return argv
 }
 
-// Cancel cancels the job, and returns it as it was before: a job already
-// over is not cancelled. The job is looked up first, as scancel exits with
-// 0 for a job it does not know, or one already over. scancel refusing, as
-// for the job of another user, is a *Refusal.
-func (c Client) Cancel(ctx context.Context, id int64) (Job, bool, error) {
+// Cancel cancels the job with scancel. The job is looked up first, as
+// scancel exits with 0 for a job it does not know, or one already over.
+func (c CLI) Cancel(ctx context.Context, id int64) (Job, bool, error) {
 	j, err := c.Job(ctx, id)
 	if err != nil {
 		return Job{}, false, err
@@ -230,8 +242,8 @@ func (c Client) Cancel(ctx context.Context, id int64) (Job, bool, error) {
 	return j, true, nil
 }
 
-// CancelAll cancels the jobs, those already over aside.
-func (c Client) CancelAll(ctx context.Context, ids []int64) error {
+// CancelAll cancels the jobs with one scancel.
+func (c CLI) CancelAll(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -260,9 +272,8 @@ func NodesArgs(names string) []string {
 	return argv
 }
 
-// Nodes returns the nodes, as a host list such as c[1-4] names them, or
-// every node.
-func (c Client) Nodes(ctx context.Context, names string) ([]Node, error) {
+// Nodes returns the nodes scontrol shows.
+func (c CLI) Nodes(ctx context.Context, names string) ([]Node, error) {
 	out, err := c.run(ctx, NodesArgs(names), nil)
 	if err != nil {
 		return nil, err
@@ -287,9 +298,8 @@ func PartitionsArgs(name string) []string {
 	return argv
 }
 
-// Partitions returns the partition, or every partition, with the states of
-// their nodes counted.
-func (c Client) Partitions(ctx context.Context, name string) ([]Partition, error) {
+// Partitions returns the partitions scontrol shows.
+func (c CLI) Partitions(ctx context.Context, name string) ([]Partition, error) {
 	out, err := c.run(ctx, PartitionsArgs(name), nil)
 	if err != nil {
 		return nil, err
@@ -301,23 +311,14 @@ func (c Client) Partitions(ctx context.Context, name string) ([]Partition, error
 	if err != nil {
 		return nil, fmt.Errorf("scontrol show partition: %w", err)
 	}
-	if name != "" {
-		partitions = slices.DeleteFunc(partitions, func(p Partition) bool { return p.Name != name })
-		if len(partitions) == 0 {
-			return nil, fmt.Errorf("scontrol show partition: no partition %s", name)
-		}
+	if partitions, err = selectPartition(partitions, name); err != nil {
+		return nil, fmt.Errorf("scontrol show partition: %w", err)
 	}
 	nodes, err := c.Nodes(ctx, "")
 	if err != nil {
 		return nil, err
 	}
-	for i := range partitions {
-		for _, n := range nodes {
-			if slices.Contains(n.Partitions, partitions[i].Name) {
-				partitions[i].Count(n)
-			}
-		}
-	}
+	countNodes(partitions, nodes)
 	return partitions, nil
 }
 
@@ -329,7 +330,7 @@ func ReadArgs(file string, limit int) []string {
 
 // ReadFile returns the first limit bytes of the file, as the host the
 // commands run on reads it, and whether it has more.
-func (c Client) ReadFile(ctx context.Context, file string, limit int) ([]byte, bool, error) {
+func (c CLI) ReadFile(ctx context.Context, file string, limit int) ([]byte, bool, error) {
 	out, err := c.Runner.Run(ctx, ReadArgs(file, limit), nil)
 	if err != nil {
 		return nil, false, err

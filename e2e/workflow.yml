@@ -1,13 +1,14 @@
 # The end-to-end tests: a Slurm cluster of one node in a container, built
 # from e2e/cluster, which the action logs in to over SSH as it would to a
-# login node, all in this one workflow. It runs under --allow-host, which the
+# login node, and asks by slurmrestd, all in this one workflow. It runs under --allow-host, which the
 # action keeps to; the shell steps that build and run the container are let
 # run with --allow-action. Run it from the repository root, with the action
 # built first, as Probe resolves it before the first job:
 #
 #   go build -o e2e/action/probe-slurm . && probe --allow-host localhost --allow-action shell e2e/workflow.yml
 #
-# E2E_PORT is the port of sshd on this side, E2E_CONTAINER the container's
+# E2E_PORT is the port of sshd on this side, E2E_REST_PORT that of
+# slurmrestd, E2E_CONTAINER the container's
 # name, and E2E_KEEP=1 leaves the container running afterwards. DOCKER is
 # the docker command, as "docker --context orbstack", and PROBE the probe
 # the last jobs run other workflows with, which default to those on PATH.
@@ -22,6 +23,7 @@ vars:
   image: probe-slurm-e2e
   container: "{{E2E_CONTAINER ?? 'probe-slurm-e2e'}}"
   port: "{{E2E_PORT ?? '12222'}}"
+  rest_port: "{{E2E_REST_PORT ?? '16820'}}"
   keep: "{{E2E_KEEP ?? ''}}"
   docker: "{{DOCKER ?? 'docker'}}"
   probe: "{{PROBE ?? 'probe'}}"
@@ -60,7 +62,7 @@ jobs:
       cmd: >-
         {{vars.docker}} rm -f {{vars.container}} >/dev/null 2>&1;
         {{vars.docker}} run -d --name {{vars.container}}
-        -p {{vars.port}}:22
+        -p {{vars.port}}:22 -p {{vars.rest_port}}:6820
         -e AUTHORIZED_KEY="$(cat {{vars.work}}/id_ed25519.pub)"
         {{vars.image}}
     test: res.code == 0
@@ -83,6 +85,26 @@ jobs:
       partitions: debug
     retry: {max_attempts: 60, interval: 1s}
     test: status == 0 && res.partitions[0].idle == 1
+
+  # As a user would make one on the login node, for slurmrestd. It is
+  # printed as SLURM_JWT=<token>, which the action takes as it is.
+  - name: Make a token for slurmrestd
+    id: token
+    uses: shell
+    with:
+      cmd: "{{vars.docker}} exec {{vars.container}} runuser -u probe -- scontrol token lifespan=3600"
+    test: res.code == 0 && res.stdout startsWith "SLURM_JWT="
+    outputs:
+      token: res.stdout
+
+  - name: Wait for slurmrestd
+    uses: slurm
+    with:
+      endpoint: "http://localhost:{{vars.rest_port}}"
+      token: "{{outputs.token.token}}"
+      partitions: debug
+    retry: {max_attempts: 30, interval: 1s}
+    test: status == 0 && res.partitions[0].idle == 1 && req.api_version == "v0.0.42"
 
 - name: Jobs
   id: jobs
@@ -235,9 +257,114 @@ jobs:
           true
     test: status == 1 && res.job_id == 0 && res.error contains "invalid partition"
 
+- name: By slurmrestd
+  id: rest
+  needs: [jobs]
+  defaults:
+    slurm:
+      endpoint: "http://localhost:{{vars.rest_port}}"
+      token: "{{outputs.token.token}}"
+      submit:
+        chdir: /home/probe
+        keep: true
+  steps:
+  # slurmrestd reads none of the #SBATCH lines of a script: the job keeps
+  # the name the action gives it.
+  - name: Submit a job
+    id: rest_hello
+    uses: slurm
+    with:
+      submit:
+        partition: debug
+        time: 1m
+        script: |
+          #!/bin/sh
+          #SBATCH --job-name=from-the-script
+          echo "hello from $SLURM_JOB_ID by slurmrestd"
+    test: |
+      status == 0 && res.job_id > 0 && res.error == "" &&
+      req.endpoint == "http://localhost:" + vars.rest_port && req.api_version == "v0.0.42" && req.command == nil
+    outputs:
+      job_id: res.job_id
+
+  - name: It completes
+    uses: slurm
+    with:
+      job: "{{outputs.rest_hello.job_id}}"
+      wait: 2m
+      poll: 1s
+    test: |
+      status == 0 && res.done == true && res.state == "COMPLETED" && res.exit_code == 0 &&
+      res.name == "probe" && res.user == "probe" &&
+      res.stdout_path == "/home/probe/slurm-" + string(outputs.rest_hello.job_id) + ".out"
+
+  - name: It wrote what it said
+    uses: shell
+    with:
+      cmd: "{{vars.docker}} exec {{vars.container}} cat /home/probe/slurm-{{outputs.rest_hello.job_id}}.out"
+    test: res.code == 0 && res.stdout == "hello from " + string(outputs.rest_hello.job_id) + " by slurmrestd\n"
+
+  - name: Submit a job that sleeps
+    id: rest_sleeper
+    uses: slurm
+    with:
+      submit:
+        name: rest-sleeper
+        time: 10m
+        mem: 1M
+        script: |
+          #!/bin/sh
+          sleep 300
+    test: status == 0
+    outputs:
+      job_id: res.job_id
+
+  - name: It is in the queue
+    uses: slurm
+    with:
+      jobs:
+        name: rest-sleeper
+    test: status == 0 && res.count == 1 && res.jobs[0].job_id == outputs.rest_sleeper.job_id && res.jobs[0].done == false
+
+  - name: Cancel it
+    uses: slurm
+    with:
+      cancel: "{{outputs.rest_sleeper.job_id}}"
+    test: status == 0 && res.cancelled == true && res.state in ["PENDING", "RUNNING"]
+
+  - name: Cancelling it again cancels nothing
+    uses: slurm
+    with:
+      cancel: "{{outputs.rest_sleeper.job_id}}"
+    retry: {max_attempts: 10, interval: 1s}
+    test: status == 0 && res.cancelled == false && res.state == "CANCELLED"
+
+  - name: A job for a partition that does not exist is refused
+    uses: slurm
+    with:
+      submit:
+        partition: nope
+        script: |
+          #!/bin/sh
+          true
+    test: status == 1 && res.job_id == 0 && res.error contains "Invalid partition name"
+
+  - name: Partitions
+    uses: slurm
+    with:
+      partitions:
+    test: status == 0 && res.count == 2 && res.partitions[1].name == "closed" && res.partitions[1].state == "DOWN"
+
+  # slurmrestd takes the name of one node; the host list is expanded here.
+  - name: Nodes of a host list
+    uses: slurm
+    with:
+      nodes: c[1-4]
+    test: status == 0 && res.count == 1 && res.nodes[0].name == "c1" && res.nodes[0].cpus == 2
+
 - name: The cluster
   id: state
-  needs: [jobs]
+  needs: [rest]
   defaults:
     slurm:
       host: localhost
@@ -292,6 +419,29 @@ jobs:
       known_hosts: "{{vars.work}}/known_hosts"
       jobs:
         name: left-behind
+        state: cancelled
+    test: status == 0 && res.count == 1
+
+  # The token is not noted for the cleanup, which reads SLURM_JWT, as the
+  # step that submitted the job did.
+  - name: A run leaves a job behind in slurmrestd
+    uses: shell
+    with:
+      cmd: "{{vars.probe}} --allow-host localhost e2e/leave-rest.yml"
+      env:
+        E2E_REST_PORT: "{{vars.rest_port}}"
+        SLURM_JWT: "{{outputs.token.token}}"
+      timeout: 120s
+    test: res.code == 0
+    echo: "{{res.stdout}}{{res.stderr}}"
+
+  - name: Its cleanup cancelled the job by slurmrestd
+    uses: slurm
+    with:
+      endpoint: "http://localhost:{{vars.rest_port}}"
+      token: "{{outputs.token.token}}"
+      jobs:
+        name: left-behind-rest
         state: cancelled
     test: status == 0 && res.count == 1
 

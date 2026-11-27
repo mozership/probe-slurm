@@ -1,0 +1,29 @@
+{
+  "errors": [
+    {
+      "description": "Batch job submission failed",
+      "error_number": 2000,
+      "error": "Invalid partition name specified",
+      "source": "slurm_submit_batch_job()"
+    }
+  ],
+  "warnings": [],
+  "meta": {
+    "plugin": {
+      "type": "openapi/slurmctld",
+      "name": "Slurm OpenAPI slurmctld",
+      "data_parser": "data_parser/v0.0.42",
+      "accounting_storage": ""
+    },
+    "command": [],
+    "slurm": {
+      "version": {
+        "major": "24",
+        "micro": "5",
+        "minor": "11"
+      },
+      "release": "24.11.5",
+      "cluster": "probe"
+    }
+  }
+}

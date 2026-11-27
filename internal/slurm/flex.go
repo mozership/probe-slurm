@@ -198,25 +198,32 @@ func (c *comment) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// reply is what every command answers with --json besides its data: the
-// errors that made it fail.
+// reply is what every command answers with --json, and slurmrestd with
+// each response, besides its data: the errors that made it fail.
 type reply struct {
-	Errors []struct {
-		Description string `json:"description"`
-		Error       string `json:"error"`
-	} `json:"errors"`
+	Errors []replyError `json:"errors"`
+}
+
+type replyError struct {
+	Description string `json:"description"`
+	Error       string `json:"error"`
+	ErrorNumber int    `json:"error_number"`
+}
+
+func (e replyError) message() string {
+	switch {
+	case e.Description == "":
+		return e.Error
+	case e.Error == "":
+		return e.Description
+	}
+	return e.Description + ": " + e.Error
 }
 
 func (r reply) err() error {
 	var msgs []string
 	for _, e := range r.Errors {
-		msg := e.Description
-		if msg == "" {
-			msg = e.Error
-		} else if e.Error != "" {
-			msg += ": " + e.Error
-		}
-		msgs = append(msgs, msg)
+		msgs = append(msgs, e.message())
 	}
 	if len(msgs) == 0 {
 		return nil
